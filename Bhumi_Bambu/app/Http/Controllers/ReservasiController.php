@@ -2,6 +2,9 @@
 
 namespace App\Http\Controllers;
 
+use Midtrans\Config;
+use Midtrans\Snap;
+use Illuminate\Support\Facades\Log;
 use App\Models\Reservasi;
 use App\Models\PaketLayanan;
 use Illuminate\Http\Request;
@@ -89,82 +92,151 @@ class ReservasiController extends Controller
         // Hapus session
         session()->forget('reservasi');
 
-        // ✅ UBAH INI: Redirect ke halaman pembayaran, bukan beranda
+        
         return redirect()->route('reservasi.payment', $reservasi->id);
     }
 
-    // ✅ TAMBAH METHOD INI: Halaman pembayaran
+    
     public function payment($id)
     {
         $reservasi = Reservasi::with('paket')->findOrFail($id);
-        
-        // Cek apakah reservasi milik user yang login
+
+        // keamanan
         if ($reservasi->user_id !== auth()->id()) {
-            abort(403, 'Unauthorized');
+        abort(403);
         }
 
-        return view('reservasi.payment', compact('reservasi'));
-    }
-
-    // ✅ TAMBAH METHOD INI: Upload bukti transfer
-    public function uploadPayment(Request $request)
-{
-    // Ambil reservasi_id dari request
-    $reservasiId = $request->input('reservasi_id');
-    
-    // Validasi
-    $request->validate([
-        'bukti_transfer' => 'required|image|mimes:jpg,jpeg,png|max:2048',
-    ]);
-
-    // Cari reservasi
-    $reservasi = Reservasi::findOrFail($reservasiId);
-
-    // Cek apakah reservasi milik user yang login
-    if ($reservasi->user_id !== auth()->id()) {
-        abort(403, 'Unauthorized');
-    }
-
-    // Upload gambar
-    if ($request->hasFile('bukti_transfer')) {
-        $file = $request->file('bukti_transfer');
-        $namaFile = 'bukti_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
-        
-        $tujuan = public_path('aset/bukti_transfer');
-        if (!is_dir($tujuan)) {
-            mkdir($tujuan, 0755, true);
+        // kalau sudah bayar
+        if ($reservasi->status_pembayaran === 'lunas') {
+            return redirect()->route('reservasi.ticket', $reservasi->id);
         }
-        
-        $file->move($tujuan, $namaFile);
-        
-        // Update reservasi
-        $reservasi->update([
-            'bukti_transfer' => 'aset/bukti_transfer/' . $namaFile,
+
+        // config midtrans
+        Config::$serverKey = config('midtrans.server_key');
+        Config::$isProduction = config('midtrans.is_production');
+        Config::$isSanitized = true;
+        Config::$is3ds = true;
+
+        $totalHarga = $reservasi->paket->harga * $reservasi->jumlah_orang;
+
+        $midtransPayload = [
+            'transaction_details' => [
+                'order_id' => $reservasi->kode_booking,
+                'gross_amount' => (int) $totalHarga,
+            ],
+            'customer_details' => [
+                'first_name' => $reservasi->nama_lengkap,
+                'email' => $reservasi->email,
+                'phone' => $reservasi->nomor_ponsel,
+            ],
+            'item_details' => [
+                [
+                'id' => 'paket_' . $reservasi->paket_id,
+                'price' => (int) $reservasi->paket->harga,
+                'quantity' => (int) $reservasi->jumlah_orang,
+                'name' => $reservasi->paket->nama_paket,
+                ]
+            ],
+        ];
+
+        $snapToken = \Midtrans\Snap::getSnapToken($midtransPayload);
+
+        return view('reservasi.payment', [
+            'reservasi' => $reservasi,
+            'snapToken' => $snapToken
         ]);
     }
 
-    return redirect()->route('reservasi.ticket', $reservasi->id);
-}
+    public function callback(Request $request)
+    {
+        \Log::info('Callback Midtrans diterima', $request->all());
 
-    // ✅ TAMBAH METHOD INI: Halaman e-ticket
+        $orderId     = trim($request->input('order_id'));
+        $statusCode  = $request->input('status_code');
+        $amount      = $request->input('gross_amount');
+        $status      = $request->input('transaction_status');
+        $fraud       = $request->input('fraud_status');
+        $signature   = $request->input('signature_key');
+
+        // validasi signature
+        $serverKey = config('midtrans.server_key');
+        $expected  = hash('sha512', $orderId . $statusCode . $amount . $serverKey);
+
+        if ($signature !== $expected) {
+            \Log::warning('Signature tidak valid', ['order_id' => $orderId]);
+            return response()->json(['message' => 'invalid'], 403);
+        }
+
+        $reservasi = Reservasi::where('kode_booking', $orderId)->first();
+
+        if (!$reservasi) {
+            \Log::error('Reservasi tidak ditemukan', ['order_id' => $orderId]);
+            return response()->json(['message' => 'not found'], 404);
+        }
+
+        // biar nggak keupdate dua kali
+        if ($reservasi->status_pembayaran === 'lunas') {
+            return response()->json(['message' => 'already processed']);
+        }
+
+        // mapping status
+        switch ($status) {
+            case 'settlement':
+                $reservasi->status_pembayaran = 'lunas';
+                $reservasi->status = 'lunas';
+                break;
+
+            case 'pending':
+                $reservasi->status_pembayaran = 'menunggu_verifikasi';
+                $reservasi->status = 'menunggu_pembayaran';
+                break;
+
+            case 'capture':
+                if ($fraud === 'challenge') {
+                    $reservasi->status_pembayaran = 'menunggu_verifikasi';
+                    $reservasi->status = 'menunggu_pembayaran';
+                } else {
+                    $reservasi->status_pembayaran = 'lunas';
+                    $reservasi->status = 'lunas';
+                }
+                break;
+
+            case 'deny':
+            case 'expire':
+            case 'cancel':
+                $reservasi->status_pembayaran = 'belum_bayar';
+                $reservasi->status = 'pending';
+                break;
+        }
+
+        $reservasi->save();
+
+        \Log::info('Status pembayaran diperbarui', [
+            'kode_booking' => $orderId,
+            'status' => $status
+        ]);
+
+        return response()->json(['message' => 'ok']);
+    }
+
     public function ticket($id)
-{
-    $reservasi = Reservasi::with('paket')->findOrFail($id);
+        {
+            $reservasi = Reservasi::with('paket')->findOrFail($id);
     
-    // Cek apakah reservasi milik user yang login
-    if ($reservasi->user_id !== auth()->id()) {
-        abort(403, 'Unauthorized');
-    }
+            // Cek apakah reservasi milik user yang login
+            if ($reservasi->user_id !== auth()->id()) {
+            abort(403, 'Unauthorized');
+            }
 
-    // Pastikan paket ada
-    if (!$reservasi->paket) {
-        return redirect()->route('beranda')->with('error', 'Data paket tidak ditemukan.');
-    }
+        // Pastikan paket ada
+        if (!$reservasi->paket) {
+            return redirect()->route('beranda')->with('error', 'Data paket tidak ditemukan.');
+        }
 
-    return view('reservasi.ticket', compact('reservasi'));
-}
+        return view('reservasi.ticket', compact('reservasi'));
+        }
 
-    //tampilkan daftar reservasi pelanggan
+        //tampilkan daftar reservasi pelanggan
     public function my()
     {
         $reservasis = Reservasi::where('user_id', auth()->id())

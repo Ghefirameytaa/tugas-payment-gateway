@@ -44,7 +44,6 @@ Route::middleware(['auth', 'role:pelanggan'])->group(function () {
     Route::get('/reservasi/review', [ReservasiController::class, 'review'])->name('reservasi.review');
     Route::post('/reservasi/confirm', [ReservasiController::class, 'confirm'])->name('reservasi.confirm');
     Route::get('/reservasi/payment/{id}', [ReservasiController::class, 'payment'])->name('reservasi.payment');
-    Route::post('/reservasi/upload-payment', [ReservasiController::class, 'uploadPayment'])->name('reservasi.upload-payment');
     Route::get('/reservasi/ticket/{id}', [ReservasiController::class, 'ticket'])->name('reservasi.ticket');
     Route::get('/reservasi/saya', [ReservasiController::class, 'my'])->name('reservasi.saya');
 });
@@ -68,6 +67,14 @@ Route::middleware(['auth', 'role:pelanggan'])->group(function () {
     Route::get('/profil/edit', [ProfilePelangganController::class, 'edit'])->name('profil.edit');
     Route::post('/profil', [ProfilePelangganController::class, 'update'])->name('profil.update');
 });
+
+// ============================================================
+// MIDTRANS CALLBACK — HARUS DI LUAR middleware auth
+// Midtrans server tidak punya session/auth, tidak bisa masuk
+// ke route yang dilindungi middleware
+// ============================================================
+Route::post('/midtrans/callback', [ReservasiController::class, 'callback']);
+
 
 /*
 |--------------------------------------------------------------------------
